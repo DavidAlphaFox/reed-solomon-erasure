@@ -17,6 +17,7 @@ Reed-Solomon 纠删码的 C++23 实现。
 
 更深入的专题文档见 `doc/`：
 
+- [一镜到底：用矩阵运算完整演示 RS(4+2) 全流程](doc/full-matrix-walkthrough.zh-CN.md)（四幕剧总览，推荐首读）
 - [完整实例：传输 1, 2, 3, 4——从编码到重建的每一个数字](doc/worked-example.zh-CN.md)（含校验行系数 = 拉格朗日基函数取值的推导）
 - [编码矩阵的解剖：top、top⁻¹、V 与 A](doc/encoding-matrix-anatomy.zh-CN.md)（插值/求值矩阵的身份、"右乘"的含义、高斯-约当求逆逐步演示）
 - [重建（解码）的内部机制：哪些是计算，哪些是查表](doc/decoding-internals.zh-CN.md)
