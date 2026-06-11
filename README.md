@@ -2,6 +2,8 @@
 
 C++23 implementation of Reed-Solomon erasure coding.
 
+[中文文档](README.zh-CN.md)（含算法核心原理与 SIMD 加速详解）
+
 This repository started as the Rust crate
 [`reed-solomon-erasure`](https://github.com/darrenldl/reed-solomon-erasure)
 (v6.0.0) and has been fully rewritten in C++23. The C++ implementation is
