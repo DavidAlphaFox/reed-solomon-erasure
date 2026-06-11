@@ -8,7 +8,9 @@
 高斯-约当消元求逆**。整个过程分三层，每层"算"与"查表"的分工不同。
 
 算法背景（多项式插值 ↔ 编码矩阵的对应关系）见
-[README.zh-CN.md 的"算法核心原理"](../README.zh-CN.md#算法核心原理)。
+[README.zh-CN.md 的"算法核心原理"](../README.zh-CN.md#算法核心原理)；
+解码的逐数值数学过程（A′ 消元全程、A′⁻¹ 每行的拉格朗日身份）见
+[decoding-walkthrough.zh-CN.md](decoding-walkthrough.zh-CN.md)。
 
 ---
 
