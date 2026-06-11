@@ -142,7 +142,7 @@ install(TARGETS reed_solomon_erasure reed_solomon_erasure_static
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
-install(DIRECTORY include/reed_solomon_erasure
+install(DIRECTORY include/rse
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 install(EXPORT reed_solomon_erasure-targets
