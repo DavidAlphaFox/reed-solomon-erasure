@@ -20,7 +20,10 @@ namespace rse::gf8 {
 inline constexpr std::size_t FIELD_SIZE = 256;       // 域的阶 2^8
 inline constexpr std::size_t GROUP_ORDER = FIELD_SIZE - 1; // 乘法群的阶（非零元个数）
 inline constexpr std::size_t EXP_TABLE_SIZE = FIELD_SIZE * 2 - 2; // exp 表双倍长度，免取模
-inline constexpr unsigned GENERATING_POLYNOMIAL = 29; // x^8+x^4+x^3+x^2+1 的低 8 位
+// 定义 GF(2^8) 的本原多项式 x^8+x^4+x^3+x^2+1（0x11D）的低 8 位。
+// "本原"保证 α=2 是乘法群的生成元，log/exp 表的构造依赖这一点；
+// Rust 原版称之为 GENERATING_POLYNOMIAL，按编码理论的标准术语更正。
+inline constexpr unsigned PRIMITIVE_POLYNOMIAL = 29;
 
 namespace detail {
 
@@ -54,7 +57,7 @@ gen_exp_table(const std::array<std::uint8_t, FIELD_SIZE>& log_table) {
 
 } // namespace detail
 
-inline constexpr auto LOG_TABLE = detail::gen_log_table(GENERATING_POLYNOMIAL);
+inline constexpr auto LOG_TABLE = detail::gen_log_table(PRIMITIVE_POLYNOMIAL);
 inline constexpr auto EXP_TABLE = detail::gen_exp_table(LOG_TABLE);
 
 namespace detail {
