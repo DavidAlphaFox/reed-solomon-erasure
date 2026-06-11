@@ -1,7 +1,7 @@
 // galois_simd.hpp - GF(2^8) SIMD 内核的内部声明（不对外安装）。
 //
 // 每个内核对一段字节切片做 GF(2^8) 常数乘法，使用"半字节拆分 + 字节
-// shuffle"技巧（详见 galois_8.hpp 中 MUL_TABLE_LOW/HIGH 的注释）：
+// shuffle"技巧（算法见 gf8_simd_kernel.hpp）：
 //   low / high  : 当前乘数对应的两张 16 字节查找表
 //   mul         : out[i] = c * in[i]（覆盖写）
 //   mul_xor     : out[i] ^= c * in[i]（异或累加）
@@ -16,6 +16,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <rse/config.hpp>
+
 namespace rse::gf8::detail {
 
 // 内核函数指针类型：返回值为已处理的字节数（向量宽度的整数倍）。
@@ -29,13 +31,13 @@ struct SimdKernels {
     const char* name; // "avx512" / "avx2" / "ssse3" / "neon" / "scalar"
 };
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if RSE_ARCH_X86_64
 SimdKernels ssse3_kernels() noexcept;  // 128 位，gf8_simd_ssse3.cpp
 SimdKernels avx2_kernels() noexcept;   // 256 位，gf8_simd_avx2.cpp
 SimdKernels avx512_kernels() noexcept; // 512 位，gf8_simd_avx512.cpp
 #endif
 
-#if defined(__aarch64__) || defined(_M_ARM64)
+#if RSE_ARCH_AARCH64
 SimdKernels neon_kernels() noexcept;   // 128 位，gf8_simd_neon.cpp
 #endif
 

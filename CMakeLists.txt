@@ -5,8 +5,16 @@
 # 使用 rse::shared / rse::static 目标。
 cmake_minimum_required(VERSION 3.23)
 
+# 版本号的唯一权威来源是 include/rse/config.hpp 中的宏定义，
+# 这里解析出来喂给 project()，避免头文件与构建系统各写一份导致漂移。
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/include/rse/config.hpp" _rse_config_hpp)
+foreach(part MAJOR MINOR PATCH)
+    string(REGEX MATCH "#define RSE_VERSION_${part} ([0-9]+)" _ "${_rse_config_hpp}")
+    set(RSE_VERSION_${part} ${CMAKE_MATCH_1})
+endforeach()
+
 project(reed_solomon_erasure
-    VERSION 6.0.0
+    VERSION ${RSE_VERSION_MAJOR}.${RSE_VERSION_MINOR}.${RSE_VERSION_PATCH}
     DESCRIPTION "C++23 implementation of Reed-Solomon erasure coding"
     LANGUAGES CXX)
 
@@ -83,8 +91,19 @@ set(RSE_CONSTEXPR_FLAGS
 
 # 源码只编译一次（PIC 对象库），静态库与动态库共享同一批对象文件。
 add_library(rse_objects OBJECT ${RSE_SOURCES})
-set_target_properties(rse_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(rse_objects PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    # 默认隐藏所有符号，只有标注了 RSE_API（见 include/rse/config.hpp）
+    # 的接口进入动态符号表：缩小二进制、加快加载、避免符号冲突。
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
 target_compile_options(rse_objects PRIVATE ${RSE_CONSTEXPR_FLAGS})
+if(WIN32)
+    # Windows 下 RSE_API 需要知道当前在"编译库"还是"使用库"
+    # （dllexport / dllimport），通过宏区分；见 config.hpp。
+    target_compile_definitions(rse_objects PRIVATE RSE_BUILDING RSE_SHARED)
+endif()
 target_include_directories(rse_objects
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -109,11 +128,16 @@ foreach(tgt reed_solomon_erasure reed_solomon_erasure_static)
     set_target_properties(${tgt} PROPERTIES OUTPUT_NAME reed_solomon_erasure)
 endforeach()
 
-# 动态库版本：libreed_solomon_erasure.so.6.0.0，SONAME 带主版本号。
+# 动态库版本：libreed_solomon_erasure.so.<major.minor.patch>，
+# SONAME 带主版本号。
 set_target_properties(reed_solomon_erasure PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}
 )
+if(WIN32)
+    # 动态库的消费者侧自动获得 dllimport 声明。
+    target_compile_definitions(reed_solomon_erasure INTERFACE RSE_SHARED)
+endif()
 
 add_library(rse::shared ALIAS reed_solomon_erasure)
 add_library(rse::static ALIAS reed_solomon_erasure_static)

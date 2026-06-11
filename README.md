@@ -87,7 +87,7 @@ r.reconstruct(shards, present).value();
 | `reconstruct(&mut [(&mut [u8], bool)])` | `reconstruct(shards, std::span<const bool> present)` |
 | `ShardByShard` | `ShardByShard<F>` |
 | panics (slice length mismatch, invert non-square, div by 0) | exceptions (`std::invalid_argument`, `std::domain_error`) |
-| build.rs table generation | `consteval` table generation in `galois_8.hpp` |
+| build.rs table generation | `consteval` table generation in `detail/gf8_tables.hpp` |
 
 ## Tests
 

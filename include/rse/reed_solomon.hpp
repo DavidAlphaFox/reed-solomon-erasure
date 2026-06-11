@@ -12,24 +12,25 @@
 // 与 Rust 版的 API 对应关系：
 //   - Result<T, Error>            -> std::expected<T, Error>
 //   - AsRef<[Elem]> 泛型分片序列  -> ShardSeqOf / MutShardSeqOf concept
-//     （vector<vector<u8>>、span 切片、数组等任意"连续分片的 range"）
+//     （见 detail/shard_view.hpp）
 //   - Option<Vec<u8>> 分片        -> std::optional<std::vector<Elem>>
 //   - (&mut [u8], bool) 分片      -> (分片序列, std::span<const bool>) 两参数
 //   - ReconstructShard trait      -> 内部的 OptionShardAccess / FlaggedShardAccess
+//
+// 逐分片编码的记账类 ShardByShard 在 shard_by_shard.hpp。
 #pragma once
 
 #include <algorithm>
-#include <concepts>
 #include <cstddef>
 #include <expected>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <ranges>
 #include <span>
 #include <vector>
 
 #include "detail/lru_cache.hpp"
+#include "detail/shard_view.hpp"
 #include "errors.hpp"
 #include "field.hpp"
 #include "matrix.hpp"
@@ -40,48 +41,6 @@ namespace rse {
 // 缓存键是"缺失分片的下标列表"——同样的缺失模式重复出现时
 // 可以跳过开销最大的矩阵求逆。
 inline constexpr std::size_t DATA_DECODE_MATRIX_CACHE_CAPACITY = 254;
-
-namespace detail {
-
-// "分片序列"concept：一个 range，其每个元素都是 Elem 的连续 range。
-// 这是 Rust 版 T: AsRef<[U]>, U: AsRef<[Elem]> 泛型约束的 C++ 对应物。
-template <typename R, typename Elem>
-concept ShardSeqOf =
-    std::ranges::sized_range<R> && std::ranges::forward_range<R> &&
-    std::ranges::contiguous_range<std::ranges::range_reference_t<R>> &&
-    std::same_as<std::ranges::range_value_t<std::ranges::range_reference_t<R>>, Elem>;
-
-// 同上，但要求分片内容可写（对应 Rust 的 AsMut<[Elem]>）。
-template <typename R, typename Elem>
-concept MutShardSeqOf =
-    ShardSeqOf<R, Elem> &&
-    requires(std::ranges::range_reference_t<R> shard) {
-        { std::ranges::data(shard) } -> std::same_as<Elem*>;
-    };
-
-// 把任意分片序列摊平成只读 span 的列表（对应 convert_2D_slices! 宏）。
-template <typename Elem, ShardSeqOf<Elem> R>
-std::vector<std::span<const Elem>> to_const_spans(R&& shards) {
-    std::vector<std::span<const Elem>> result;
-    result.reserve(std::ranges::size(shards));
-    for (auto&& shard : shards) {
-        result.emplace_back(std::ranges::data(shard), std::ranges::size(shard));
-    }
-    return result;
-}
-
-// 同上，可写版本。
-template <typename Elem, MutShardSeqOf<Elem> R>
-std::vector<std::span<Elem>> to_mut_spans(R&& shards) {
-    std::vector<std::span<Elem>> result;
-    result.reserve(std::ranges::size(shards));
-    for (auto&& shard : shards) {
-        result.emplace_back(std::ranges::data(shard), std::ranges::size(shard));
-    }
-    return result;
-}
-
-} // namespace detail
 
 // Reed-Solomon 纠删码编解码器。
 //
@@ -113,8 +72,8 @@ public:
     //   parity_shards == 0                     -> TooFewParityShards
     //   data_shards + parity_shards > F::ORDER -> TooManyShards
     //     （编码矩阵的行必须对应互不相同的域元素，所以分片总数受域阶限制）
-    static std::expected<ReedSolomon, Error> create(std::size_t data_shards,
-                                                    std::size_t parity_shards) {
+    [[nodiscard]] static std::expected<ReedSolomon, Error> create(std::size_t data_shards,
+                                                                  std::size_t parity_shards) {
         if (data_shards == 0) {
             return std::unexpected(Error::TooFewDataShards);
         }
@@ -166,7 +125,7 @@ public:
     }
 
     // 相等性只看配置参数（对应 Rust 版 PartialEq 的实现）。
-    bool operator==(const ReedSolomon& rhs) const noexcept {
+    [[nodiscard]] bool operator==(const ReedSolomon& rhs) const noexcept {
         return data_shard_count_ == rhs.data_shard_count_ &&
                parity_shard_count_ == rhs.parity_shard_count_;
     }
@@ -181,13 +140,17 @@ public:
     // 写入后 parity_shard_count 个槽位（无需事先清零，会被完整覆盖）。
     // 模板版本接受任意可写分片序列，摊平成 span 后转发给 *_spans 核心。
     template <detail::MutShardSeqOf<typename F::Elem> T>
-    std::expected<void, Error> encode(T&& shards) const {
+    [[nodiscard]] std::expected<void, Error> encode(T&& shards) const {
         auto spans = detail::to_mut_spans<Elem>(shards);
         return encode_spans(spans);
     }
 
-    std::expected<void, Error> encode_spans(std::span<std::span<Elem>> slices) const {
-        if (auto r = check_piece_count_all(slices.size()); !r) return r;
+    [[nodiscard]] std::expected<void, Error>
+    encode_spans(std::span<std::span<Elem>> slices) const {
+        if (auto r = check_count(slices.size(), total_shard_count_, Error::TooFewShards,
+                                 Error::TooManyShards);
+            !r)
+            return r;
         if (auto r = check_slices_multi(slices); !r) return r;
 
         // 切成输入（数据分片）与输出（校验分片）两段。
@@ -201,16 +164,23 @@ public:
     // 编码（分离式）：数据分片以只读视图传入，只写校验分片。
     // 适合在编码的同时让其他线程只读地使用数据分片。
     template <detail::ShardSeqOf<typename F::Elem> T, detail::MutShardSeqOf<typename F::Elem> U>
-    std::expected<void, Error> encode_sep(const T& data, U&& parity) const {
+    [[nodiscard]] std::expected<void, Error> encode_sep(const T& data, U&& parity) const {
         auto data_spans = detail::to_const_spans<Elem>(data);
         auto parity_spans = detail::to_mut_spans<Elem>(parity);
         return encode_sep_spans(data_spans, parity_spans);
     }
 
-    std::expected<void, Error> encode_sep_spans(std::span<const std::span<const Elem>> data,
-                                                std::span<std::span<Elem>> parity) const {
-        if (auto r = check_piece_count_data(data.size()); !r) return r;
-        if (auto r = check_piece_count_parity(parity.size()); !r) return r;
+    [[nodiscard]] std::expected<void, Error>
+    encode_sep_spans(std::span<const std::span<const Elem>> data,
+                     std::span<std::span<Elem>> parity) const {
+        if (auto r = check_count(data.size(), data_shard_count_, Error::TooFewDataShards,
+                                 Error::TooManyDataShards);
+            !r)
+            return r;
+        if (auto r = check_count(parity.size(), parity_shard_count_, Error::TooFewParityShards,
+                                 Error::TooManyParityShards);
+            !r)
+            return r;
         if (auto r = check_slices_multi_multi(data, parity); !r) return r;
 
         // 用编码矩阵的校验行做实际计算。
@@ -224,17 +194,21 @@ public:
     // 警告：必须严格按 0..data_shard_count 的顺序依次调用，
     // 否则校验分片结果错误。推荐使用 ShardByShard 记账类代替直接调用。
     template <detail::MutShardSeqOf<typename F::Elem> T>
-    std::expected<void, Error> encode_single(std::size_t i_data, T&& shards) const {
+    [[nodiscard]] std::expected<void, Error> encode_single(std::size_t i_data,
+                                                           T&& shards) const {
         auto spans = detail::to_mut_spans<Elem>(shards);
         return encode_single_spans(i_data, spans);
     }
 
-    std::expected<void, Error> encode_single_spans(std::size_t i_data,
-                                                   std::span<std::span<Elem>> slices) const {
+    [[nodiscard]] std::expected<void, Error>
+    encode_single_spans(std::size_t i_data, std::span<std::span<Elem>> slices) const {
         if (i_data >= data_shard_count_) {
             return std::unexpected(Error::InvalidIndex);
         }
-        if (auto r = check_piece_count_all(slices.size()); !r) return r;
+        if (auto r = check_count(slices.size(), total_shard_count_, Error::TooFewShards,
+                                 Error::TooManyShards);
+            !r)
+            return r;
         if (auto r = check_slices_multi(slices); !r) return r;
 
         const std::span<const Elem> input = slices[i_data];
@@ -245,20 +219,22 @@ public:
     // 逐分片编码（分离式）：单独传入第 i_data 个数据分片与校验分片组。
     // i_data == 0 的调用会完整覆盖校验分片，因此正确使用时无需预清零。
     template <detail::MutShardSeqOf<typename F::Elem> U>
-    std::expected<void, Error> encode_single_sep(std::size_t i_data,
-                                                 std::span<const Elem> single_data,
-                                                 U&& parity) const {
+    [[nodiscard]] std::expected<void, Error>
+    encode_single_sep(std::size_t i_data, std::span<const Elem> single_data, U&& parity) const {
         auto parity_spans = detail::to_mut_spans<Elem>(parity);
         return encode_single_sep_spans(i_data, single_data, parity_spans);
     }
 
-    std::expected<void, Error> encode_single_sep_spans(std::size_t i_data,
-                                                       std::span<const Elem> single_data,
-                                                       std::span<std::span<Elem>> parity) const {
+    [[nodiscard]] std::expected<void, Error>
+    encode_single_sep_spans(std::size_t i_data, std::span<const Elem> single_data,
+                            std::span<std::span<Elem>> parity) const {
         if (i_data >= data_shard_count_) {
             return std::unexpected(Error::InvalidIndex);
         }
-        if (auto r = check_piece_count_parity(parity.size()); !r) return r;
+        if (auto r = check_count(parity.size(), parity_shard_count_, Error::TooFewParityShards,
+                                 Error::TooManyParityShards);
+            !r)
+            return r;
         if (auto r = check_slices_multi(parity); !r) return r;
         if (parity[0].size() != single_data.size()) {
             return std::unexpected(Error::IncorrectShardSize);
@@ -275,13 +251,16 @@ public:
     // 内部分配一块与校验分片同尺寸的临时缓冲区后转发给
     // verify_with_buffer；频繁调用时建议直接用带缓冲区的版本。
     template <detail::ShardSeqOf<typename F::Elem> T>
-    std::expected<bool, Error> verify(const T& shards) const {
+    [[nodiscard]] std::expected<bool, Error> verify(const T& shards) const {
         auto spans = detail::to_const_spans<Elem>(shards);
         return verify_spans(spans);
     }
 
-    std::expected<bool, Error> verify_spans(std::span<const std::span<const Elem>> slices) const {
-        if (auto r = check_piece_count_all(slices.size()); !r) {
+    [[nodiscard]] std::expected<bool, Error>
+    verify_spans(std::span<const std::span<const Elem>> slices) const {
+        if (auto r = check_count(slices.size(), total_shard_count_, Error::TooFewShards,
+                                 Error::TooManyShards);
+            !r) {
             return std::unexpected(r.error());
         }
         if (auto r = check_slices_multi(slices); !r) {
@@ -298,19 +277,24 @@ public:
     // 避免每次调用都做堆分配。只要返回值不是错误，调用结束后缓冲区中
     // 必然是正确的校验分片——无论校验结果是 true 还是 false。
     template <detail::ShardSeqOf<typename F::Elem> T, detail::MutShardSeqOf<typename F::Elem> U>
-    std::expected<bool, Error> verify_with_buffer(const T& shards, U&& buffer) const {
+    [[nodiscard]] std::expected<bool, Error> verify_with_buffer(const T& shards,
+                                                                U&& buffer) const {
         auto spans = detail::to_const_spans<Elem>(shards);
         auto buffer_spans = detail::to_mut_spans<Elem>(buffer);
         return verify_with_buffer_spans(spans, buffer_spans);
     }
 
-    std::expected<bool, Error>
+    [[nodiscard]] std::expected<bool, Error>
     verify_with_buffer_spans(std::span<const std::span<const Elem>> slices,
                              std::span<std::span<Elem>> buffer) const {
-        if (auto r = check_piece_count_all(slices.size()); !r) {
+        if (auto r = check_count(slices.size(), total_shard_count_, Error::TooFewShards,
+                                 Error::TooManyShards);
+            !r) {
             return std::unexpected(r.error());
         }
-        if (auto r = check_piece_count_parity_buf(buffer.size()); !r) {
+        if (auto r = check_count(buffer.size(), parity_shard_count_, Error::TooFewBufferShards,
+                                 Error::TooManyBufferShards);
+            !r) {
             return std::unexpected(r.error());
         }
         if (auto r = check_slices_multi_multi(slices, buffer); !r) {
@@ -337,22 +321,25 @@ public:
     // 从 "optional 分片" 重建所有分片：nullopt 表示缺失，重建后就地
     // 填充为新分配的缓冲区。所有现存分片长度必须一致。
     // 检查不通过返回错误时不修改任何分片。
-    std::expected<void, Error> reconstruct(std::span<OptionShard> shards) const {
+    [[nodiscard]] std::expected<void, Error> reconstruct(std::span<OptionShard> shards) const {
         OptionShardAccess access{shards};
         return reconstruct_internal(access, shards.size(), false);
     }
 
-    std::expected<void, Error> reconstruct(std::vector<OptionShard>& shards) const {
+    [[nodiscard]] std::expected<void, Error>
+    reconstruct(std::vector<OptionShard>& shards) const {
         return reconstruct(std::span<OptionShard>(shards));
     }
 
     // 同上，但只重建数据分片（缺失的校验分片保持 nullopt）。
-    std::expected<void, Error> reconstruct_data(std::span<OptionShard> shards) const {
+    [[nodiscard]] std::expected<void, Error>
+    reconstruct_data(std::span<OptionShard> shards) const {
         OptionShardAccess access{shards};
         return reconstruct_internal(access, shards.size(), true);
     }
 
-    std::expected<void, Error> reconstruct_data(std::vector<OptionShard>& shards) const {
+    [[nodiscard]] std::expected<void, Error>
+    reconstruct_data(std::vector<OptionShard>& shards) const {
         return reconstruct_data(std::span<OptionShard>(shards));
     }
 
@@ -361,21 +348,23 @@ public:
     // 对应 Rust 版以 (&mut [u8], bool) 元组为分片的形态。
     // 注意 present 标志不会被更新——重建成功后调用方自行知晓全部就绪。
     template <detail::MutShardSeqOf<typename F::Elem> T>
-    std::expected<void, Error> reconstruct(T&& shards, std::span<const bool> present) const {
+    [[nodiscard]] std::expected<void, Error> reconstruct(T&& shards,
+                                                         std::span<const bool> present) const {
         auto spans = detail::to_mut_spans<Elem>(shards);
         return reconstruct_spans(spans, present, false);
     }
 
     // 就地重建，仅数据分片。
     template <detail::MutShardSeqOf<typename F::Elem> T>
-    std::expected<void, Error> reconstruct_data(T&& shards, std::span<const bool> present) const {
+    [[nodiscard]] std::expected<void, Error>
+    reconstruct_data(T&& shards, std::span<const bool> present) const {
         auto spans = detail::to_mut_spans<Elem>(shards);
         return reconstruct_spans(spans, present, true);
     }
 
-    std::expected<void, Error> reconstruct_spans(std::span<std::span<Elem>> shards,
-                                                 std::span<const bool> present,
-                                                 bool data_only) const {
+    [[nodiscard]] std::expected<void, Error>
+    reconstruct_spans(std::span<std::span<Elem>> shards, std::span<const bool> present,
+                      bool data_only) const {
         // 标志数量与分片数量必须一致（Rust 版由元组结构天然保证，
         // C++ 版分成两个参数后需要显式检查）。
         if (present.size() != shards.size()) {
@@ -386,15 +375,26 @@ public:
     }
 
     // ShardByShard 使用的内部检查；不属于稳定 API。
-    std::expected<void, Error> check_sbs_all(std::span<std::span<Elem>> slices) const {
-        if (auto r = check_piece_count_all(slices.size()); !r) return r;
+    [[nodiscard]] std::expected<void, Error>
+    check_sbs_all(std::span<std::span<Elem>> slices) const {
+        if (auto r = check_count(slices.size(), total_shard_count_, Error::TooFewShards,
+                                 Error::TooManyShards);
+            !r)
+            return r;
         return check_slices_multi(std::span<const std::span<Elem>>(slices));
     }
 
-    std::expected<void, Error> check_sbs_sep(std::span<const std::span<const Elem>> data,
-                                             std::span<std::span<Elem>> parity) const {
-        if (auto r = check_piece_count_data(data.size()); !r) return r;
-        if (auto r = check_piece_count_parity(parity.size()); !r) return r;
+    [[nodiscard]] std::expected<void, Error>
+    check_sbs_sep(std::span<const std::span<const Elem>> data,
+                  std::span<std::span<Elem>> parity) const {
+        if (auto r = check_count(data.size(), data_shard_count_, Error::TooFewDataShards,
+                                 Error::TooManyDataShards);
+            !r)
+            return r;
+        if (auto r = check_count(parity.size(), parity_shard_count_, Error::TooFewParityShards,
+                                 Error::TooManyParityShards);
+            !r)
+            return r;
         return check_slices_multi_multi(data, parity);
     }
 
@@ -422,38 +422,20 @@ private:
 
     // --- 参数检查（对应 Rust 版的 check_piece_count! / check_slices! 宏）---
 
-    // 分片总数必须恰好等于配置值。
-    std::expected<void, Error> check_piece_count_all(std::size_t n) const {
-        if (n < total_shard_count_) return std::unexpected(Error::TooFewShards);
-        if (n > total_shard_count_) return std::unexpected(Error::TooManyShards);
-        return {};
-    }
-
-    // 数据分片数必须恰好等于配置值。
-    std::expected<void, Error> check_piece_count_data(std::size_t n) const {
-        if (n < data_shard_count_) return std::unexpected(Error::TooFewDataShards);
-        if (n > data_shard_count_) return std::unexpected(Error::TooManyDataShards);
-        return {};
-    }
-
-    // 校验分片数必须恰好等于配置值。
-    std::expected<void, Error> check_piece_count_parity(std::size_t n) const {
-        if (n < parity_shard_count_) return std::unexpected(Error::TooFewParityShards);
-        if (n > parity_shard_count_) return std::unexpected(Error::TooManyParityShards);
-        return {};
-    }
-
-    // verify_with_buffer 的缓冲区分片数检查（错误码不同于上面）。
-    std::expected<void, Error> check_piece_count_parity_buf(std::size_t n) const {
-        if (n < parity_shard_count_) return std::unexpected(Error::TooFewBufferShards);
-        if (n > parity_shard_count_) return std::unexpected(Error::TooManyBufferShards);
+    // 数量必须恰好等于期望值，否则按多/少返回相应错误。
+    // 统一了原先 all/data/parity/parity_buf 四个重复的检查函数。
+    [[nodiscard]] static std::expected<void, Error>
+    check_count(std::size_t n, std::size_t expected, Error too_few, Error too_many) {
+        if (n < expected) return std::unexpected(too_few);
+        if (n > expected) return std::unexpected(too_many);
         return {};
     }
 
     // 检查一组分片：首分片非空、所有分片长度一致。
     // 对应 check_slices!(multi => ...)。
     template <typename SpanLike>
-    static std::expected<void, Error> check_slices_multi(std::span<SpanLike> slices) {
+    [[nodiscard]] static std::expected<void, Error>
+    check_slices_multi(std::span<SpanLike> slices) {
         const std::size_t size = slices[0].size();
         if (size == 0) {
             return std::unexpected(Error::EmptyShard);
@@ -469,8 +451,8 @@ private:
     // 检查两组分片：各自满足 multi 检查，且两组首分片长度一致。
     // 对应 check_slices!(multi => ..., multi => ...)。
     template <typename L, typename R>
-    static std::expected<void, Error> check_slices_multi_multi(std::span<L> left,
-                                                               std::span<R> right) {
+    [[nodiscard]] static std::expected<void, Error> check_slices_multi_multi(std::span<L> left,
+                                                                             std::span<R> right) {
         if (auto r = check_slices_multi(left); !r) return r;
         if (auto r = check_slices_multi(right); !r) return r;
         if (left[0].size() != right[0].size()) {
@@ -634,7 +616,10 @@ private:
     template <typename Access>
     std::expected<void, Error> reconstruct_internal(Access& shards, std::size_t shard_count,
                                                     bool data_only) const {
-        if (auto r = check_piece_count_all(shard_count); !r) return r;
+        if (auto r = check_count(shard_count, total_shard_count_, Error::TooFewShards,
+                                 Error::TooManyShards);
+            !r)
+            return r;
 
         // 第一遍扫描：统计现存分片数并核对长度一致性。
         // 如果所有分片都在，直接成功返回，什么都不用做。
@@ -796,110 +781,6 @@ private:
     Matrix<F> matrix_;               // 编码矩阵（顶部单位阵 + 校验行）
     mutable std::mutex cache_mutex_; // 保护下面的解码矩阵缓存
     mutable LruMatrixCache cache_;
-};
-
-// 逐分片编码的记账类（对应 Rust 版的 ShardByShard）。
-//
-// 适用场景：流式数据编码——数据分片不是一次性就绪，希望边收边算
-// 摊薄编码开销（例如网络收包，逐包编码比攒齐 N 个包再统一编码均匀）。
-// 它替使用者维护"下一个该编码的下标"，避免直接调用 encode_single
-// 时顺序出错。
-//
-// 用法：对每个数据分片依次调用 encode（或 encode_sep）；
-// 全部 data 个分片编码完成后 parity_ready() 为 true，校验分片可用；
-// 之后调用 reset 复位再编码下一批。
-template <FieldType F>
-class ShardByShard {
-public:
-    using Elem = typename F::Elem;
-
-    explicit ShardByShard(const ReedSolomon<F>& codec) : codec_(&codec), cur_input_(0) {}
-
-    // 校验分片是否已经就绪（所有数据分片都已编码）。
-    [[nodiscard]] bool parity_ready() const noexcept {
-        return cur_input_ == codec_->data_shard_count();
-    }
-
-    // 复位记账状态。已有分片编码但校验分片尚未就绪时返回
-    // SBSError::LeftoverShards（防止半途而废的校验分片被误用）。
-    std::expected<void, SBSError> reset() {
-        if (cur_input_ > 0 && !parity_ready()) {
-            return std::unexpected(SBSError::leftover_shards());
-        }
-        cur_input_ = 0;
-        return {};
-    }
-
-    // 无条件复位（跳过检查）。
-    void reset_force() noexcept { cur_input_ = 0; }
-
-    // 返回当前待编码的数据分片下标。
-    [[nodiscard]] std::size_t cur_input_index() const noexcept { return cur_input_; }
-
-    // 用当前下标对应的数据分片部分地构造校验分片。
-    // 所有数据分片都已编码后再调用返回 SBSError::TooManyCalls。
-    template <detail::MutShardSeqOf<typename F::Elem> T>
-    std::expected<void, SBSError> encode(T&& shards) {
-        auto spans = detail::to_mut_spans<Elem>(shards);
-        return encode_spans(spans);
-    }
-
-    std::expected<void, SBSError> encode_spans(std::span<std::span<Elem>> shards) {
-        if (auto r = sbs_encode_checks(shards); !r) {
-            return r;
-        }
-        // 参数检查已全部通过，此处失败属于逻辑错误，直接以 value() 断言。
-        codec_->encode_single_spans(cur_input_, shards).value();
-        ++cur_input_;
-        return {};
-    }
-
-    // 同 encode，但数据与校验分片分开传入（数据只读）。
-    template <detail::ShardSeqOf<typename F::Elem> T, detail::MutShardSeqOf<typename F::Elem> U>
-    std::expected<void, SBSError> encode_sep(const T& data, U&& parity) {
-        auto data_spans = detail::to_const_spans<Elem>(data);
-        auto parity_spans = detail::to_mut_spans<Elem>(parity);
-        return encode_sep_spans(data_spans, parity_spans);
-    }
-
-    std::expected<void, SBSError> encode_sep_spans(std::span<const std::span<const Elem>> data,
-                                                   std::span<std::span<Elem>> parity) {
-        if (auto r = sbs_encode_sep_checks(data, parity); !r) {
-            return r;
-        }
-        codec_->encode_single_sep_spans(cur_input_, data[cur_input_], parity).value();
-        ++cur_input_;
-        return {};
-    }
-
-private:
-    // encode 的前置检查：先看是否已编码完，再做编解码器的常规检查；
-    // 后者的错误包装为 SBSError::RSError。检查失败不改变记账状态，
-    // 因此修正参数后可以安全重试。
-    std::expected<void, SBSError> sbs_encode_checks(std::span<std::span<Elem>> slices) {
-        if (parity_ready()) {
-            return std::unexpected(SBSError::too_many_calls());
-        }
-        if (auto r = codec_->check_sbs_all(slices); !r) {
-            return std::unexpected(SBSError::rs_error(r.error()));
-        }
-        return {};
-    }
-
-    std::expected<void, SBSError>
-    sbs_encode_sep_checks(std::span<const std::span<const Elem>> data,
-                          std::span<std::span<Elem>> parity) {
-        if (parity_ready()) {
-            return std::unexpected(SBSError::too_many_calls());
-        }
-        if (auto r = codec_->check_sbs_sep(data, parity); !r) {
-            return std::unexpected(SBSError::rs_error(r.error()));
-        }
-        return {};
-    }
-
-    const ReedSolomon<F>* codec_;
-    std::size_t cur_input_; // 下一个待编码的数据分片下标
 };
 
 } // namespace rse

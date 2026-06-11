@@ -23,23 +23,19 @@ namespace rse::gf8 {
 
 namespace {
 
-// 标量实现：逐字节查 64KiB 乘法表。
-// 对应 Rust 版的 mul_slice_pure_rust（那边手工做了 4 路展开，
-// 这里交给编译器自动向量化/展开）。
+// 标量实现：逐字节查 64KiB 乘法表。XOR 为 false 时覆盖写，为 true 时
+// 异或累加——与 SIMD 内核同样的编译期双形态，消除成对的重复函数。
+// （对应 Rust 版的 mul_slice_pure_rust / mul_slice_xor_pure_rust。）
+template <bool XOR>
 void mul_slice_scalar(std::uint8_t c, std::span<const std::uint8_t> input,
                       std::span<std::uint8_t> out) {
     const auto& mt = MUL_TABLE[c];
     for (std::size_t i = 0; i < input.size(); ++i) {
-        out[i] = mt[input[i]];
-    }
-}
-
-// 标量实现的异或累加版（对应 mul_slice_xor_pure_rust）。
-void mul_slice_xor_scalar(std::uint8_t c, std::span<const std::uint8_t> input,
-                          std::span<std::uint8_t> out) {
-    const auto& mt = MUL_TABLE[c];
-    for (std::size_t i = 0; i < input.size(); ++i) {
-        out[i] ^= mt[input[i]];
+        if constexpr (XOR) {
+            out[i] ^= mt[input[i]];
+        } else {
+            out[i] = mt[input[i]];
+        }
     }
 }
 
@@ -48,6 +44,25 @@ void check_same_length(std::span<const std::uint8_t> input, std::span<std::uint8
     if (input.size() != out.size()) {
         throw std::invalid_argument("gf8: input/output length mismatch");
     }
+}
+
+// mul_slice / mul_slice_xor 的公共骨架：
+// 长度检查 -> SIMD 内核处理主体 -> 标量补齐尾部。
+template <bool XOR>
+void mul_slice_impl(std::uint8_t c, std::span<const std::uint8_t> input,
+                    std::span<std::uint8_t> out) {
+    check_same_length(input, out);
+    if (input.empty()) {
+        return;
+    }
+
+    const auto& kernels = detail::active_kernels();
+    const auto kernel = XOR ? kernels.mul_xor : kernels.mul;
+    const std::size_t done =
+        kernel(MUL_TABLE_LOW[c].data(), MUL_TABLE_HIGH[c].data(), input.data(), out.data(),
+               input.size());
+
+    mul_slice_scalar<XOR>(c, input.subspan(done), out.subspan(done));
 }
 
 } // namespace
@@ -65,7 +80,7 @@ std::size_t scalar_noop(const std::uint8_t*, const std::uint8_t*, const std::uin
 // 运行时 CPU 能力检测，按"越宽越好"的顺序选择内核。
 // 只在进程内执行一次（见 active_kernels 中的静态局部变量）。
 SimdKernels detect_kernels() noexcept {
-#if defined(__x86_64__) || defined(_M_X64)
+#if RSE_ARCH_X86_64
 #if defined(__GNUC__) || defined(__clang__)
     __builtin_cpu_init();
     // _mm512_shuffle_epi8 需要 AVX-512BW（仅 AVX-512F 不够）。
@@ -83,7 +98,7 @@ SimdKernels detect_kernels() noexcept {
     // 上早已普及，保守起见只启用到 SSSE3。
     return ssse3_kernels();
 #endif
-#elif defined(__aarch64__) || defined(_M_ARM64)
+#elif RSE_ARCH_AARCH64
     // NEON 是 AArch64 的基线特性，无需检测。
     return neon_kernels();
 #endif
@@ -104,32 +119,12 @@ std::string_view simd_backend() noexcept { return detail::active_kernels().name;
 
 void mul_slice(std::uint8_t c, std::span<const std::uint8_t> input,
                std::span<std::uint8_t> out) {
-    check_same_length(input, out);
-    if (input.empty()) {
-        return;
-    }
-
-    // SIMD 内核处理向量宽度整数倍的主体，返回已处理的字节数。
-    const std::size_t done = detail::active_kernels().mul(
-        MUL_TABLE_LOW[c].data(), MUL_TABLE_HIGH[c].data(), input.data(), out.data(),
-        input.size());
-
-    // 剩余尾部交给标量查表。
-    mul_slice_scalar(c, input.subspan(done), out.subspan(done));
+    mul_slice_impl<false>(c, input, out);
 }
 
 void mul_slice_xor(std::uint8_t c, std::span<const std::uint8_t> input,
                    std::span<std::uint8_t> out) {
-    check_same_length(input, out);
-    if (input.empty()) {
-        return;
-    }
-
-    const std::size_t done = detail::active_kernels().mul_xor(
-        MUL_TABLE_LOW[c].data(), MUL_TABLE_HIGH[c].data(), input.data(), out.data(),
-        input.size());
-
-    mul_slice_xor_scalar(c, input.subspan(done), out.subspan(done));
+    mul_slice_impl<true>(c, input, out);
 }
 
 void slice_xor(std::span<const std::uint8_t> input, std::span<std::uint8_t> out) {

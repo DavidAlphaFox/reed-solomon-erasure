@@ -12,12 +12,14 @@
 // 这两组别名对应 Rust 版的 galois_8::ReedSolomon 等类型别名。
 #pragma once
 
-#include "errors.hpp"       // IWYU pragma: export
-#include "field.hpp"        // IWYU pragma: export
-#include "galois_16.hpp"    // IWYU pragma: export
-#include "galois_8.hpp"     // IWYU pragma: export
-#include "matrix.hpp"       // IWYU pragma: export
-#include "reed_solomon.hpp" // IWYU pragma: export
+#include "config.hpp"         // IWYU pragma: export
+#include "errors.hpp"         // IWYU pragma: export
+#include "field.hpp"          // IWYU pragma: export
+#include "galois_16.hpp"      // IWYU pragma: export
+#include "galois_8.hpp"       // IWYU pragma: export
+#include "matrix.hpp"         // IWYU pragma: export
+#include "reed_solomon.hpp"   // IWYU pragma: export
+#include "shard_by_shard.hpp" // IWYU pragma: export
 
 namespace rse {
 
